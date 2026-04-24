@@ -192,9 +192,12 @@ class Stage2Dataset(Dataset):
                               'lipsync_kp_canonical', 'lipsync_A', 'lipsync_sim_gt']
                 )
                 if lipsync_paths_ok:
-                    arr_data['lipsync_f_s']           = np.load(data['lipsync_f_s'])
-                    arr_data['lipsync_x_s']           = np.load(data['lipsync_x_s'])
-                    arr_data['lipsync_kp_canonical']  = np.load(data['lipsync_kp_canonical'])
+                    # Store only paths for large arrays to prevent OOM during PKL preload
+                    arr_data['lipsync_f_s_path']           = data['lipsync_f_s']
+                    arr_data['lipsync_x_s_path']           = data['lipsync_x_s']
+                    arr_data['lipsync_kp_canonical_path']  = data['lipsync_kp_canonical']
+                    
+                    # Small arrays (per-window) are safe to preload
                     arr_data['lipsync_A']             = np.load(data['lipsync_A'])      # (N_win, 512)
                     arr_data['lipsync_sim_gt']        = np.load(data['lipsync_sim_gt']) # (N_win,)
 
@@ -379,9 +382,11 @@ class Stage2Dataset(Dataset):
             else:
                 window_idx = min(window_idx, max_window)
 
-                data_dict['lipsync_f_s']           = arr_data['lipsync_f_s'].squeeze(0)
-                data_dict['lipsync_x_s']           = arr_data['lipsync_x_s'].squeeze(0)
-                data_dict['lipsync_kp_canonical']  = arr_data['lipsync_kp_canonical'].squeeze(0)
+                # Lazily load the large arrays
+                data_dict['lipsync_f_s']           = np.load(arr_data['lipsync_f_s_path']).squeeze(0)
+                data_dict['lipsync_x_s']           = np.load(arr_data['lipsync_x_s_path']).squeeze(0)
+                data_dict['lipsync_kp_canonical']  = np.load(arr_data['lipsync_kp_canonical_path']).squeeze(0)
+                
                 data_dict['lipsync_A']             = A_arr[window_idx]
                 data_dict['lipsync_sim_gt']        = sim_gt_arr[window_idx]
                 data_dict['lipsync_t_start']       = t_start
