@@ -198,18 +198,29 @@ class Stage2Dataset(Dataset):
                     arr_data['lipsync_A']             = np.load(data['lipsync_A'])      # (N_win, 512)
                     arr_data['lipsync_sim_gt']        = np.load(data['lipsync_sim_gt']) # (N_win,)
 
-                    # Compatibility check via optional meta file
+                    # Sanity check via optional meta file.
+                    # NOTE: meta['syncnet_frames'] is ALWAYS 5 (SyncNet architecture
+                    # constraint). Do NOT compare it to lip_sync_num_frames (16) —
+                    # that is the training render window, a completely different concept.
+                    # Render-window slicing happens in lip_sync_loss.py, not here.
+                    import json as _json, os as _os
                     meta_path = data['lipsync_A'].replace('lipsync_syncnet_A.npy',
                                                           'lipsync_meta.json')
-                    import json as _json, os as _os
                     if _os.path.isfile(meta_path):
                         with open(meta_path) as _mf:
                             meta = _json.load(_mf)
-                        old_nf = meta.get('num_frames', -1)
-                        if old_nf != self.lip_sync_num_frames and not self._compat_warned:
+                        syncnet_nf = meta.get('syncnet_frames', meta.get('num_frames', 5))
+                        if syncnet_nf != 5 and not self._compat_warned:
                             self._compat_warned = True
-                            print(_REGEN_HINT.format(
-                                old=old_nf, new=self.lip_sync_num_frames))
+                            print(
+                                f"\n[LipSync] WARNING: lipsync_meta.json reports "
+                                f"syncnet_frames={syncnet_nf}, expected 5. "
+                                f"SyncNet requires exactly 5 frames. Regenerate:\n"
+                                f"  python ditto-train/preprocess_lipsync_features.py "
+                                f"-i /workspace/HDTF/data_info.json "
+                                f"--syncnet_ckpt checkpoints/lipsync_expert.pth "
+                                f"--ditto_pytorch_path checkpoints/ditto_pytorch\n"
+                            )
                             arr_data['lipsync_valid'] = False
                             return arr_data
 
@@ -218,6 +229,7 @@ class Stage2Dataset(Dataset):
                     arr_data['lipsync_valid'] = False
             except Exception:
                 arr_data['lipsync_valid'] = False
+
 
         return arr_data
     

@@ -7,21 +7,23 @@ Precomputes per-video features needed for lip-sync loss during Ditto training:
     3. kp_canon   — canonical keypoints         (1, 63)
     4. syncnet_A  — SyncNet audio embeddings    (N_windows, 512)
     5. sim_gt     — GT similarity scores        (N_windows,)
-    6. meta       — lipsync_meta.json with num_frames stamp
+    6. meta       — lipsync_meta.json with syncnet_frames stamp
 
-These are saved alongside existing features and referenced in data_list_json.
+SyncNet architecture note:
+    The pretrained SyncNet face encoder expects exactly 5 frames × 3 channels = 15 ch.
+    Therefore --num_frames (= syncnet_frames) is ALWAYS 5 and should not be changed.
+    The training 'lip_sync_num_frames=16' is the RENDER WINDOW for supervision —
+    the dataset samples a 5-frame sub-window from the longer render for SyncNet.
 
 Usage:
     python preprocess_lipsync_features.py \\
         -i /workspace/HDTF/data_info.json \\
         --syncnet_ckpt checkpoints/lipsync_expert.pth \\
         --ditto_pytorch_path checkpoints/ditto_pytorch \\
-        --num_frames 16 \\
         --device cuda
 
 Multi-GPU:
     CUDA_VISIBLE_DEVICES=0 python preprocess_lipsync_features.py ... --num_gpus 4 --gpu_id 0 &
-    CUDA_VISIBLE_DEVICES=1 python preprocess_lipsync_features.py ... --num_gpus 4 --gpu_id 1 &
     ...
 """
 
@@ -376,7 +378,8 @@ def process_one_video(
 
     # Save meta file so the dataset can verify num_frames compatibility
     import json as _json
-    meta = {'num_frames': num_frames,
+    meta = {'syncnet_frames': num_frames,   # always 5 (SyncNet architecture constraint)
+            'num_frames':     num_frames,   # alias for backward compat
             'N_windows': int(len(A_array)),
             'fps': fps}
     with open(os.path.join(output_dir, 'lipsync_meta.json'), 'w') as _mf:
@@ -400,8 +403,15 @@ def main():
     parser.add_argument("--num_gpus", type=int, default=1,  help="Total number of GPUs")
     parser.add_argument("--gpu_id",   type=int, default=0,  help="This GPU ID (for sharding)")
     parser.add_argument("--output_key", default="lipsync", help="Key prefix in data_info.json")
-    parser.add_argument("--num_frames", type=int, default=16,
-                        help="Consecutive frames per SyncNet window (must match training config, default 16)")
+    parser.add_argument("--num_frames", type=int, default=5,
+                        help=(
+                            "SyncNet input window in frames. "
+                            "MUST be 5 (pretrained SyncNet architecture constraint: "
+                            "conv1 weight=[32,15,7,7] = 5x3=15 channels). "
+                            "Do NOT change this to 16 — training uses a separate "
+                            "render window (lip_sync_num_frames=16) and slices "
+                            "a 5-frame sub-window internally."
+                        ))
     args = parser.parse_args()
 
     device = args.device

@@ -265,8 +265,8 @@ if [ "$USE_LIP_SYNC" -eq 1 ]; then
                 --ditto_pytorch_path "${DITTO_PYTORCH_PATH}" \
                 --device "cuda" \
                 --num_gpus "${NUM_GPUS}" \
-                --gpu_id "${gpu_id}" \
-                --num_frames "${LIP_SYNC_NUM_FRAMES}" &
+                --gpu_id "${gpu_id}" &
+                # NOTE: --num_frames intentionally omitted (always 5, SyncNet constraint)
             pids+=($!)
             log "  GPU $gpu_id: PID ${pids[-1]}"
         done
@@ -308,8 +308,8 @@ print(f'  Merged {filled}/{N} lip-sync entries into {info_path}')
             -i "${DATA_INFO_JSON}" \
             --syncnet_ckpt "${SYNCNET_CKPT}" \
             --ditto_pytorch_path "${DITTO_PYTORCH_PATH}" \
-            --device "cuda" \
-            --num_frames "${LIP_SYNC_NUM_FRAMES}"
+            --device "cuda"
+            # NOTE: --num_frames intentionally omitted (always 5, SyncNet constraint)
     fi
 
     ok "Lip-sync features preprocessed."

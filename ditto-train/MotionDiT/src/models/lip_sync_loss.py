@@ -15,6 +15,14 @@ New features (v2):
     B) Delay-aware timing penalty — renders ±max_shift offsets on-the-fly
     C) Lip landmark supervision — reuses MediaPipe 478-pt lmk array
 
+SyncNet architecture constraint:
+    The pretrained SyncNet face encoder's first conv weight is [32, 15, 7, 7],
+    meaning it ALWAYS expects exactly 5 frames × 3 channels = 15 channels.
+    This is fixed by the checkpoint and cannot be changed.
+    SYNCNET_FRAMES = 5 is therefore a hard constant throughout this module.
+    'num_frames' (default 16) is the RENDER WINDOW for supervision —
+    we render more frames, then slice a 5-frame sub-window for SyncNet.
+
 Gradient flow:
     loss → SyncNet face_encoder → lip crop → SPADEDecoder → WarpNetwork
          → keypoint transform → predicted motion → diffusion model
@@ -26,6 +34,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# ---------------------------------------------------------------------------
+# SyncNet architecture hard constant — DO NOT CHANGE
+# The pretrained face encoder conv1 weight is [32, 15, 7, 7]:
+#   15 channels = SYNCNET_FRAMES (5) × 3 RGB channels
+# ---------------------------------------------------------------------------
+SYNCNET_FRAMES = 5
 
 # ---------------------------------------------------------------------------
 # MediaPipe FaceMesh lip indices (478-point model)
@@ -226,22 +241,33 @@ def compute_hard_weight(l_sync_val: float,
 
 
 def _visual_embedding(syncnet_face_encoder, rendered_window,
-                      B: int, T: int, lip_h: int, lip_w: int,
+                      B: int, lip_h: int, lip_w: int,
                       syncnet_A):
-    """Shared helper: rendered window → normalised visual embedding + cosine sim."""
-    rendered_flat = rendered_window.reshape(B * T, 3,
+    """
+    Shared helper: rendered 5-frame window → normalised visual embedding + sim.
+
+    Args:
+        rendered_window: (B, SYNCNET_FRAMES, 3, H, W)  — MUST be exactly 5 frames
+    """
+    T_in = rendered_window.shape[1]
+    assert T_in == SYNCNET_FRAMES, (
+        f"SyncNet face encoder requires exactly {SYNCNET_FRAMES} frames "
+        f"({SYNCNET_FRAMES * 3} channels) but got {T_in} frames ({T_in * 3} ch). "
+        f"This is a pretrained architecture constraint."
+    )
+    rendered_flat = rendered_window.reshape(B * T_in, 3,
                                             rendered_window.shape[-2],
                                             rendered_window.shape[-1])
-    lips        = extract_lip_region(rendered_flat, lip_h, lip_w)
-    lips        = lips.reshape(B, T, 3, lip_h, lip_w)
-    lips_stacked = lips.reshape(B, T * 3, lip_h, lip_w)
+    lips         = extract_lip_region(rendered_flat, lip_h, lip_w)
+    lips         = lips.reshape(B, T_in, 3, lip_h, lip_w)
+    lips_stacked = lips.reshape(B, T_in * 3, lip_h, lip_w)  # (B, 15, 48, 96)
 
-    v = syncnet_face_encoder(lips_stacked)
-    v = v.view(v.size(0), -1)
-    v = F.normalize(v, p=2, dim=1)           # (B, 512)
+    v   = syncnet_face_encoder(lips_stacked)
+    v   = v.view(v.size(0), -1)
+    v   = F.normalize(v, p=2, dim=1)           # (B, 512)
 
     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
-    sim = cos(syncnet_A, v)                   # (B,)
+    sim = cos(syncnet_A, v)                     # (B,)
     return v, sim
 
 
@@ -277,17 +303,25 @@ class LipSyncLoss(nn.Module):
     ):
         super().__init__()
 
-        self.device     = device
-        self.lip_h      = lip_h
-        self.lip_w      = lip_w
-        self.num_frames = num_frames
-        self.max_shift  = max_shift
+        self.device         = device
+        self.lip_h          = lip_h
+        self.lip_w          = lip_w
+        self.num_frames     = num_frames     # render window (training supervision)
+        self.max_shift      = max_shift
+        self.syncnet_frames = SYNCNET_FRAMES # always 5 — SyncNet architecture constraint
+
+        # Center offset: where the 5-frame SyncNet window sits inside the render window
+        # e.g. num_frames=16 → center_offset=5  (frames 5..9 of the 16-frame render)
+        self.center_offset  = max(0, (num_frames - self.syncnet_frames) // 2)
 
         from .syncnet import load_syncnet
         self.syncnet  = load_syncnet(syncnet_ckpt, device)
         self.renderer = FrozenRenderer(warp_ckpt, decoder_ckpt, device)
 
         self.cos_sim  = nn.CosineSimilarity(dim=1, eps=1e-6)
+
+        print(f"[LipSyncLoss] render_window={num_frames}  syncnet_frames={SYNCNET_FRAMES}  "
+              f"center_offset={self.center_offset}  max_shift={max_shift}")
 
         # Warn once if lmk is unavailable
         self._lmk_warned = False
@@ -323,48 +357,50 @@ class LipSyncLoss(nn.Module):
     # -----------------------------------------------------------------------
 
     def _delay_aware_penalty(self, rendered_ext, syncnet_A,
-                             sim_pred, B, T):
+                             sim_pred, B):
         """
-        Compute delay-aware alignment penalty from an extended rendered window.
+        Compute delay-aware alignment penalty.
+
+        We shift the 5-frame SyncNet evaluation window (center_offset + shift)
+        within the extended render. Zero-shift is already computed differentiably
+        in forward() and passed in as sim_pred.
 
         Args:
-            rendered_ext: (B, T + 2*max_shift, 3, H, W)  — already rendered
-            syncnet_A:    (B, 512)                         — audio embedding
-            sim_pred:     (B,)                             — zero-shift sim (differentiable)
-            B, T:         ints
+            rendered_ext: (B, T + 2*max_shift, 3, H, W)
+            syncnet_A:    (B, 512)
+            sim_pred:     (B,)  zero-shift sim, differentiable
+            B:            int   batch size
 
         Returns:
-            delay_penalty:  scalar (grad flows through sim_pred only)
-            best_shift:     float (mean best temporal offset in frames)
-            sim_best:       float (mean best-shift similarity, detached)
+            delay_penalty, best_shift (float), sim_best (float)
         """
         s_range = list(range(-self.max_shift, self.max_shift + 1))
 
-        # Zero shift already computed differentiably — reuse sim_pred
-        all_sims = {0: sim_pred.detach()}  # detached copy for argmax comparison
+        # Zero-shift already computed — reuse (detached copy for argmax)
+        all_sims = {0: sim_pred.detach()}
 
         for s in s_range:
             if s == 0:
                 continue
-            s_start = self.max_shift + s
-            s_end   = s_start + T
-            # These non-zero-shift renders do NOT contribute to gradients
+            # Shift the centered 5-frame window by s frames
+            s_start = self.max_shift + self.center_offset + s
+            s_end   = s_start + self.syncnet_frames          # always 5
+
             with torch.no_grad():
-                rendered_s = rendered_ext[:, s_start:s_end, :, :, :]
+                rendered_s = rendered_ext[:, s_start:s_end, :, :, :]  # (B,5,3,H,W)
                 _, sim_s   = _visual_embedding(
                     self.syncnet.face_encoder,
-                    rendered_s, B, T,
+                    rendered_s, B,
                     self.lip_h, self.lip_w,
                     syncnet_A,
                 )
                 all_sims[s] = sim_s
 
-        sims_list   = torch.stack([all_sims[s] for s in s_range], dim=1)  # (B, n_shifts)
-        # best similarity and which shift achieved it (fully detached — target only)
-        sim_best_per, best_idx = sims_list.detach().max(dim=1)      # (B,)
-        best_shift  = (best_idx.float() - self.max_shift).mean().item()
+        sims_list              = torch.stack([all_sims[s] for s in s_range], dim=1)
+        sim_best_per, best_idx = sims_list.detach().max(dim=1)       # (B,)
+        best_shift             = (best_idx.float() - self.max_shift).mean().item()
 
-        # Push zero-shift sim UP toward sim_best (gradient through sim_pred only)
+        # Push zero-shift sim toward sim_best (gradient through sim_pred only)
         delay_penalty = (sim_best_per - sim_pred).clamp(min=0.0).mean()
 
         return delay_penalty, best_shift, sim_best_per.mean().item()
@@ -452,12 +488,12 @@ class LipSyncLoss(nn.Module):
             lmk_loss:      scalar — landmark L1 loss (0 if disabled/unavailable)
         """
         B       = pred_motion_window.shape[0]
-        T       = self.num_frames
-        T_ext   = T + 2 * self.max_shift   # expected extended length
+        T       = self.num_frames                      # render window (e.g. 16)
+        SF      = self.syncnet_frames                  # always 5 — SyncNet constraint
+        T_ext   = T + 2 * self.max_shift               # extended length for delay-aware
 
-        # Validate window length
+        # Validate / pad window length
         if pred_motion_window.shape[1] != T_ext:
-            # Graceful fallback: trim or zero-pad
             actual = pred_motion_window.shape[1]
             if actual < T_ext:
                 pad = pred_motion_window[:, -1:, :].expand(B, T_ext - actual, -1)
@@ -471,20 +507,23 @@ class LipSyncLoss(nn.Module):
                 pred_motion_window, kp_canonical, f_s, x_s
             )  # (B, T_ext, 3, H, W)
 
-        # 2. Zero-shift slice (differentiable path)
-        rendered_zero = rendered_ext[:, self.max_shift:self.max_shift + T, :, :, :]
+        # 2. Zero-shift: pick the centered 5-frame SyncNet sub-window (differentiable)
+        #    In the extended window, the zero-shift render starts at max_shift.
+        #    Within that T-frame render, the SyncNet window is at center_offset.
+        z_start       = self.max_shift + self.center_offset
+        z_end         = z_start + SF                   # always SF=5 frames
+        rendered_sync = rendered_ext[:, z_start:z_end, :, :, :]  # (B, 5, 3, H, W)
 
         if debug:
-            print(f"  [RENDER] ext shape: {rendered_ext.shape}, "
-                  f"zero shape: {rendered_zero.shape}")
+            print(f"  [RENDER] ext={rendered_ext.shape}  sync_slice=[{z_start}:{z_end}]")
             print(f"  [RENDER] range: [{rendered_ext.min():.4f}, {rendered_ext.max():.4f}]")
-            diff = (rendered_zero[:, 1:] - rendered_zero[:, :-1]).abs().mean()
-            print(f"  [RENDER] inter-frame diff: {diff:.6f}")
+            diff = (rendered_sync[:, 1:] - rendered_sync[:, :-1]).abs().mean()
+            print(f"  [RENDER] inter-frame diff (sync window): {diff:.6f}")
 
-        # 3. Visual embedding (differentiable)
+        # 3. Visual embedding — always exactly 5 frames → 15 channels (SyncNet constraint)
         v_pred, sim_per_sample = _visual_embedding(
             self.syncnet.face_encoder,
-            rendered_zero, B, T,
+            rendered_sync, B,          # NOTE: no T arg — inferred from shape (must be 5)
             self.lip_h, self.lip_w,
             syncnet_A,
         )
@@ -493,7 +532,7 @@ class LipSyncLoss(nn.Module):
             print(f"  [SYNCNET] v_pred norm: {v_pred.norm(dim=1).mean():.4f}")
             print(f"  [SIM] sim_pred mean={sim_per_sample.mean():.4f}")
             if debug_dir is not None:
-                self._save_debug_images(rendered_zero, debug_dir, debug_step)
+                self._save_debug_images(rendered_sync, debug_dir, debug_step)
 
         # 4. Primary losses
         l_sync   = (1.0 - sim_per_sample).mean().clamp(0.0, 2.0)
@@ -507,22 +546,21 @@ class LipSyncLoss(nn.Module):
         # 6. Delay-aware penalty (B)
         if use_delay_aware and self.max_shift > 0:
             delay_penalty, best_shift, sim_best = self._delay_aware_penalty(
-                rendered_ext, syncnet_A, sim_per_sample, B, T
+                rendered_ext, syncnet_A, sim_per_sample, B
             )
         else:
             delay_penalty = torch.tensor(0.0, device=self.device)
             best_shift    = 0.0
             sim_best      = float(sim_per_sample.mean().detach())
 
-        # 7. Lip landmark loss (D)
+        # 7. Lip landmark loss (D) — uses full render window for richer comparison
         if lmk_window is not None:
-            # Reconstruct driving keypoints for landmark comparison
             pred_kp_list = []
             for t in range(T):
                 mt  = pred_motion_window[:, self.max_shift + t, :]  # (B, 265)
                 x_d = motion_vec_to_keypoints(mt, kp_canonical)      # (B, 21, 3)
                 pred_kp_list.append(x_d)
-            pred_kp_window = torch.stack(pred_kp_list, dim=1)  # (B, T, 21, 3)
+            pred_kp_window = torch.stack(pred_kp_list, dim=1)        # (B, T, 21, 3)
             lmk_loss = self._landmark_loss(pred_kp_window, lmk_window)
         else:
             lmk_loss = torch.tensor(0.0, device=self.device)
